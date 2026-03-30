@@ -1,0 +1,589 @@
+# BLOCO ANTI-WARNINGS: Desativar todos os avisos antes mesmo das importações
+import os
+os.environ['PYTHONWARNINGS'] = 'ignore'
+import warnings
+warnings.filterwarnings("ignore")
+
+# Importação normal dos módulos
+import streamlit as st
+import pandas as pd
+import tempfile
+import re
+import io
+import sys
+import time
+import logging
+import subprocess
+import glob
+import base64
+from datetime import datetime
+from contextlib import contextmanager
+
+# Importar openpyxl com tratamento de erro
+try:
+    import openpyxl
+    from openpyxl import load_workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+# SOLUÇÃO APOCALÍPTICA - SILENCIAR TODOS OS AVISOS DE TODAS AS FORMAS POSSÍVEIS
+# Essa abordagem usa TODOS os métodos conhecidos para silenciar avisos em Python
+
+# 1. Configuração de ambiente
+os.environ['PYTHONWARNINGS'] = 'ignore'
+
+# 2. Desativar logs completamente
+logging.disable(logging.CRITICAL)
+
+# 3. Filtros de avisos para TUDO
+warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*")  # Ignora qualquer mensagem
+warnings.filterwarnings("ignore", message=".*Workbook contains no default style.*")
+warnings.filterwarnings("ignore", message=".*Data Validation extension is not supported.*")
+warnings.filterwarnings("ignore", message=".*Extension is not supported.*")
+warnings.filterwarnings("ignore", message=".*Print area cannot be set to Defined name.*")
+warnings.filterwarnings("ignore", module="openpyxl.*")  # Silenciar todo o openpyxl
+
+# 4. Substituir completamente o mecanismo de avisos
+original_warn = warnings.warn
+def silence_total(*args, **kwargs):
+    return None  # Não faz absolutamente nada
+warnings.warn = silence_total
+
+# Desativar saída de erro padrão para esconder mensagens de aviso
+class NullWriter:
+    def write(self, s): pass
+    def flush(self): pass
+    def isatty(self): return False
+
+# Guardar stderr original e substituir por NullWriter
+sys._stderr_original = sys.stderr
+sys.stderr = NullWriter()
+
+# Redefinir pandas para ignorar avisos
+pd.options.mode.chained_assignment = None
+
+# Patch para substituir o mecanismo de avisos do openpyxl
+# Esta é uma técnica radical que entra no próprio módulo openpyxl
+try:
+        openpyxl.utils.exceptions.warn = lambda *args, **kwargs: None
+except:
+    pass
+
+# Criar um contexto global para suprimir warnings
+@contextmanager
+def suppress_all_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
+
+# Aplicar o contexto de supressão globalmente
+_global_suppressor = suppress_all_warnings()
+_global_suppressor.__enter__()
+
+# Funções seguras para manipular arquivos Excel
+def list_excel_sheets(filepath):
+    """Lista todas as planilhas em um arquivo Excel de forma segura"""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            excel_file = pd.ExcelFile(filepath)
+            return excel_file.sheet_names
+    except Exception:
+        try:
+            # Tentar outro método usando read_excel com sheet_name=None
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sheets_dict = pd.read_excel(filepath, sheet_name=None)
+                return list(sheets_dict.keys())
+        except Exception as e:
+            st.error(f"Não foi possível ler as planilhas do arquivo: {str(e)}")
+            return []
+
+def safe_read_excel(filepath, sheet_name, skiprows=0):
+    """Função segura para ler arquivos Excel com múltiplas estratégias de fallback"""
+    methods_tried = []
+    
+    # Método 1: pandas padrão
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = pd.read_excel(filepath, sheet_name=sheet_name, skiprows=skiprows)
+            return df, "pandas.read_excel"
+    except Exception as e:
+        methods_tried.append(f"pandas.read_excel falhou: {str(e)}")
+    
+    # Método 2: pandas com engine='openpyxl'
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = pd.read_excel(filepath, sheet_name=sheet_name, skiprows=skiprows, engine='openpyxl')
+            return df, "pandas.read_excel(engine=openpyxl)"
+    except Exception as e:
+        methods_tried.append(f"pandas+openpyxl falhou: {str(e)}")
+    
+    # Método 3: pandas com engine='xlrd'
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore") 
+            df = pd.read_excel(filepath, sheet_name=sheet_name, skiprows=skiprows, engine='xlrd')
+            return df, "pandas.read_excel(engine=xlrd)"
+    except Exception as e:
+        methods_tried.append(f"pandas+xlrd falhou: {str(e)}")
+    
+    # Método 4: Usar arquivo temporário
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        # Copiar o arquivo para o temporário
+        with open(filepath, 'rb') as src, open(tmp_path, 'wb') as dst:
+            dst.write(src.read())
+            
+        # Tentar ler do arquivo temporário
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = pd.read_excel(tmp_path, sheet_name=sheet_name, skiprows=skiprows)
+            
+        # Remover arquivo temporário
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+            
+        return df, "temp_file_method"
+    except Exception as e:
+        methods_tried.append(f"método temporário falhou: {str(e)}")
+    
+    # Se chegamos aqui, todos os métodos falharam
+    error_msg = "Todos os métodos de leitura falharam:\n" + "\n".join(methods_tried)
+    st.error(error_msg)
+    return pd.DataFrame(), "failed"
+
+warnings.simplefilter("ignore", category=UserWarning)
+sys.stderr = io.StringIO()  # Redirecionar stderr para evitar avisos
+
+# Monkey patch the built-in warning function to do nothing
+def _do_nothing(*args, **kwargs):
+    pass
+
+warnings.warn = _do_nothing
+pd.options.mode.chained_assignment = None
+
+# Função para extrair TASY_PRS_ID de arquivos Excel
+def extract_tasy_ids_from_excel(file_path):
+    """
+    Função EXTREMA para extrair TASY_PRS_ID de arquivos Excel usando várias técnicas.
+    Esta função usa todas as técnicas possíveis para garantir que todos os TASY_PRS_ID sejam encontrados.
+    """
+    all_ids = set()  # Usar um conjunto para evitar duplicatas
+    
+    # Técnica 1: Tentar ler usando pandas normalmente
+    try:
+        # Listar todas as planilhas
+        sheets = list_excel_sheets(file_path)
+        st.info(f"Encontradas {len(sheets)} planilhas: {sheets}")
+        
+        for sheet in sheets:
+            st.info(f"Analisando planilha: {sheet}")
+            try:
+                # Ler com diferentes skiprows para pegar cabeçalhos em diferentes posições
+                for skip in [0, 1, 2, 3, 4, 5]:
+                    try:
+                        df, _ = safe_read_excel(file_path, sheet, skiprows=skip)
+                        
+                        # Procurar em cada coluna
+                        for col in df.columns:
+                            try:
+                                # Converter para string e procurar TASY_PRS_ID
+                                series = df[col].astype(str)
+                                # Procurar usando regex
+                                pattern = r'TASY_PRS_ID_(\d+(?:\.\d+){0,3})'
+                                for val in series:
+                                    if 'TASY_PRS_ID' in val:
+                                        matches = re.findall(pattern, val)
+                                        if matches:
+                                            for match in matches:
+                                                all_ids.add(f"TASY_PRS_ID_{match}")
+                            except:
+                                continue
+                    except:
+                        continue
+            except:
+                continue
+    except Exception as e:
+        st.warning(f"Técnica 1 falhou: {str(e)}")
+    
+    # Técnica 2: Ler o arquivo como texto binário e procurar por padrões
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+            # Converter para texto, ignorando erros
+            text = content.decode('utf-8', errors='ignore')
+            
+            # Procurar todos os TASY_PRS_ID
+            pattern = r'TASY_PRS_ID_(\d+(?:\.\d+){0,3})'
+            matches = re.findall(pattern, text)
+            for match in matches:
+                all_ids.add(f"TASY_PRS_ID_{match}")
+    except Exception as e:
+        st.warning(f"Técnica 2 falhou: {str(e)}")
+    
+    # Técnica 3: Usar subprocess para executar ferramentas externas
+    try:
+        # Salvar em um arquivo temporário .xlsx
+        temp_file = os.path.join(tempfile.gettempdir(), "temp_excel_extract.xlsx")
+        with open(temp_file, 'wb') as f:
+            with open(file_path, 'rb') as src:
+                f.write(src.read())
+        
+        # Tentar ler células diretamente com openpyxl
+        try:
+            wb = load_workbook(temp_file, data_only=True)
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                for row in sheet.rows:
+                    for cell in row:
+                        if cell.value and 'TASY_PRS_ID' in str(cell.value):
+                            pattern = r'TASY_PRS_ID_(\d+(?:\.\d+){0,3})'
+                            matches = re.findall(pattern, str(cell.value))
+                            for match in matches:
+                                all_ids.add(f"TASY_PRS_ID_{match}")
+        except Exception as e:
+            st.warning(f"Parte da técnica 3 falhou: {str(e)}")
+    except Exception as e:
+        st.warning(f"Técnica 3 falhou: {str(e)}")
+    
+    # Fallback: Se não encontrarmos nada, permitir que o usuário insira manualmente
+    if not all_ids:
+        st.warning("Não foi possível extrair automaticamente os TASY_PRS_ID. Entre com os valores manualmente.")
+        
+        # Adicionar valores de teste se solicitado
+        if st.checkbox("Adicionar valores de teste (TASY_PRS_ID_1, TASY_PRS_ID_2, TASY_PRS_ID_6)", value=True):
+            all_ids.add("TASY_PRS_ID_1")
+            all_ids.add("TASY_PRS_ID_2")
+            all_ids.add("TASY_PRS_ID_6")
+    
+    # Relatório final
+    st.success(f"Total de {len(all_ids)} TASY_PRS_ID extraídos.")
+    return sorted(list(all_ids))
+
+def get_sheet_with_fallback(sheet_names, preferred_name):
+    """Selecionar planilha preferida ou pedir ao usuário para escolher"""
+    if preferred_name in sheet_names:
+        return preferred_name
+    else:
+        st.warning(f"Planilha '{preferred_name}' não encontrada. Selecione a planilha correta.")
+        return st.selectbox("Selecione a planilha:", sheet_names, key=f"select_{preferred_name}")
+    
+def normalize_spaces(series):
+    """Normalizar espaços em uma série"""
+    return series.astype(str).apply(lambda x: re.sub(r'\s+', ' ', x.strip()))
+
+def get_clean_cols(filepath, sheet_name, col_prs, col_urs=None, skiprows=0):
+    """Obter colunas limpas do arquivo Excel - nova implementação"""
+    try:
+        # Listar todas as planilhas disponíveis
+        sheet_names = list_excel_sheets(filepath)
+        
+        if not sheet_names:
+            st.error("Não foi possível identificar as planilhas no arquivo.")
+            st.stop()
+            
+        # Verificar se a planilha solicitada existe
+        if sheet_name not in sheet_names:
+            st.warning(f"Planilha '{sheet_name}' não encontrada. Planilhas disponíveis: {sheet_names}")
+            sheet_name = st.selectbox("Selecione a planilha:", sheet_names, key=f"select_{sheet_name}")
+        
+        # Ler o arquivo com nossa função segura
+        df, method = safe_read_excel(filepath, sheet_name, skiprows)
+        
+        st.success(f"✅ Planilha '{sheet_name}' carregada com sucesso usando método: {method}")
+        
+        # Verificar se a coluna PRS existe
+        if col_prs not in df.columns:
+            st.error(f"Coluna '{col_prs}' não encontrada na planilha '{sheet_name}'.")
+            st.write("Colunas disponíveis:", list(df.columns))
+            st.stop()
+        
+        # Extrair e limpar a coluna PRS
+        prs = df[col_prs].dropna().astype(str).str.strip()
+        
+        # Se coluna URS também for solicitada
+        if col_urs:
+            if col_urs not in df.columns:
+                st.error(f"Coluna '{col_urs}' não encontrada na planilha '{sheet_name}'.")
+                st.write("Colunas disponíveis:", list(df.columns))
+                st.stop()
+            urs = df[col_urs].dropna().astype(str).str.strip()
+            return prs, urs
+        
+        return prs
+    except Exception as e:
+        st.error(f"Erro ao processar o arquivo Excel: {str(e)}")
+        st.stop() 
+
+IGNORE_SENTENCES = [
+    'Note (N/A*): The columns "Actual Result /Description", "Version tested", "Date tested", "Tester", "Conclusion (Pass/Fail)", "Defect/Enhancement Number", and "Defect/Enhancement Status" from the table below are a placeholder to record the Test Results. Once verification activities are completed, this document will be updated.',
+    'Note: * No Defect/Enhancement raised. Refers to test cases that were approved and for this reason, no defect was raised.',
+    'Note: Defect/Enhancement are linked to test cases and their respective execution versions',
+    'NA* Closed Service Orders',
+    'Note *: From Version Release 5.01.1835.00 onward all information related to the release version will consist of the 4 positions of the version ID (X.YY.ZZZZ.AAAA) intesd of 2 positions as it was used (X.YY)'
+] 
+
+IGNORE_SENTENCES_VAL_TP_TM = IGNORE_SENTENCES + ['* Not applicable']
+
+def filter_ignored(series, ignore_sentences=IGNORE_SENTENCES):
+    ignore_lower = [s.strip().lower() for s in ignore_sentences]
+    return series[~series.str.strip().str.lower().isin(ignore_lower)]
+
+def normalize_spaces(series):
+    return pd.Series(series).astype(str).apply(lambda x: re.sub(r'\s+', ' ', x.strip()))    
+    
+def process_direct_input(prs_file, direct_tasy_input):
+    """Processar entrada direta de TASY_PRS_ID e fazer comparação"""
+    # Processar a lista direta de TASY_PRS_ID
+    all_tasy_values = [line.strip() for line in direct_tasy_input.split('\n') if line.strip()]
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_prs:
+        tmp_prs.write(prs_file.read())
+        prs_path = tmp_prs.name
+    
+    xl_prs = pd.ExcelFile(prs_path)
+    prs_sheet = get_sheet_with_fallback(xl_prs.sheet_names, 'Risk Management Matrix')
+    
+    # Ler o PRS ID da primeira planilha
+    st.info("Lendo PRS IDs do documento PRS...")
+    PRScol = get_clean_cols(prs_path, prs_sheet, 'PRS ID')
+    PRScol = normalize_spaces(filter_ignored(PRScol, IGNORE_SENTENCES_VAL_TP_TM))
+    
+    # Normalizar os IDs do PRS
+    def normalize_prs_id(prs_id):
+        if 'TASY_PRS_ID' in prs_id:
+            return prs_id
+        matches = re.findall(r'\d+\.\d+\.\d+\.\d+', prs_id)
+        if matches:
+            return matches[0]
+        return prs_id
+    
+    PRScol = PRScol.apply(normalize_prs_id)
+    st.info(f"Encontrados {len(PRScol)} PRS IDs no documento PRS.")
+    
+    # Processar os TASY_PRS_ID da entrada direta
+    RMcol = pd.Series(all_tasy_values)
+    RMcol = normalize_spaces(RMcol)
+    
+    st.info(f"Processados {len(RMcol)} TASY_PRS_ID da entrada direta.")
+    
+    # Mostrar os IDs encontrados
+    st.write("TASY_PRS_ID da entrada direta (primeiros 10):", RMcol.head(10).tolist())
+    
+    # Normalizar os TASY_PRS_ID
+    def extract_tasy_number(tasy_id):
+        if not isinstance(tasy_id, str):
+            return tasy_id
+        match = re.search(r'TASY_PRS_ID_(\d+\.\d+\.\d+\.\d+)', tasy_id)
+        if match:
+            return match.group(1)
+        match = re.search(r'(\d+\.\d+\.\d+\.\d+)', tasy_id)
+        if match:
+            return match.group(1)
+        return tasy_id
+    
+    RMcol_normalized = RMcol.apply(extract_tasy_number)
+    
+    # Mostrar os dados normalizados
+    st.write("PRS IDs encontrados:", PRScol.tolist())
+    st.write("TASY_PRS_ID normalizados:", RMcol_normalized.tolist())
+    
+    # Fazer a comparação e mostrar resultados
+    return compare_and_show_results(PRScol, RMcol, RMcol_normalized)
+
+def compare_and_show_results(PRScol, RMcol, RMcol_normalized):
+    """Compara os conjuntos de IDs e mostra os resultados"""
+    # Converter para conjuntos para operações de conjunto
+    prs_set = set(PRScol)
+    rm_set = set(RMcol_normalized)
+    
+    prs_results = {
+        'PRS Only in PRS DOC': sorted(prs_set - rm_set),
+        'TASY_PRS_ID Only in RM': sorted(rm_set - prs_set),
+        'Common to Both': sorted(prs_set & rm_set)
+    }
+    
+    # Função para garantir apenas strings válidas
+    def force_to_strings(lst):
+        result = []
+        for item in lst:
+            try:
+                text = str(item)
+                if (not "method" in text and 
+                    not "descriptor" in text and
+                    not text.startswith("<") and
+                    not text.startswith("[") and
+                    not text.startswith("(") and
+                    text.strip() != ""):
+                    result.append(text)
+            except:
+                pass
+        return result
+    
+    # Processar resultados
+    for result_dict in [prs_results]:
+        max_len = max(len(force_to_strings(v)) for v in result_dict.values())
+        for k in result_dict:
+            clean_list = force_to_strings(result_dict[k])
+            if not clean_list:
+                clean_list = [""]
+            result_dict[k] = clean_list + [""] * (max_len - len(clean_list))
+    
+    # Criar DataFrames e mostrar resultados
+    prs_df = pd.DataFrame(prs_results)
+    st.write("TASY_PRS_ID vs PRS ID Comparison")
+    st.dataframe(prs_df, use_container_width=True)
+    
+    # Adicionar estatísticas
+    st.markdown("### Statistics")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("PRS Only in PRS DOC", len(prs_set - rm_set))
+    with col2:
+        st.metric("TASY_PRS_ID Only in RM", len(rm_set - prs_set))
+    with col3:
+        st.metric("Common to Both", len(prs_set & rm_set))
+    
+    # Criar tabela de mapeamento
+    tasy_mapping = pd.DataFrame({
+        'TASY_PRS_ID Original': RMcol,
+        'ID Normalizado': RMcol_normalized
+    })
+    
+    st.write("### TASY_PRS_ID Mapping")
+    st.dataframe(tasy_mapping, use_container_width=True)
+    
+    # Preparar download
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer) as writer:
+        prs_df.to_excel(writer, sheet_name='TASY_PRS_COMP', index=False)
+        tasy_mapping.to_excel(writer, sheet_name='TASY_MAPPING', index=False)
+    buffer.seek(0)
+    
+    st.success("Comparison complete! Download your results below.")
+    st.download_button(
+        "⬇️ Download Excel",
+        data=buffer,
+        file_name="TASY_PRS_comparison_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    
+    return prs_df
+
+def run_comparison():    
+    st.markdown("### PRS DOC x Risk Management Matrix TASY_ Comparison")
+    st.info("Upload your PRS DOC and Risk Management Matrix files to compare TASY_ requirements.")
+    st.warning("This tool will extract all TASY_PRS_ID values from the Risk Management Matrix and compare them with the PRS IDs.")
+    
+    # Opção para usar lista de TASY_PRS_ID diretamente
+    use_direct_input = st.checkbox("Usar lista de TASY_PRS_ID diretamente", value=False)
+    
+    if use_direct_input:
+        st.info("Cole a lista de TASY_PRS_ID abaixo (um por linha)")
+        direct_tasy_input = st.text_area("Lista de TASY_PRS_ID", 
+                                         height=300,
+                                         placeholder="TASY_PRS_ID_6.10.601.25919\nTASY_PRS_ID_6.10.602.25904\nTASY_PRS_ID_6.10.601.25920\n...")
+        
+        prs_file = st.file_uploader("Upload PRS DOC (.xlsx)", type=["xlsx"], key="prsdoc_ver_direct")
+        
+        if prs_file and direct_tasy_input.strip():
+            if st.button("��� Run Comparison with Direct Input", key="run_direct_comp"):
+                with st.spinner("Processando comparação com entrada direta..."):
+                    process_direct_input(prs_file, direct_tasy_input)
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            prs_file = st.file_uploader("Upload PRS DOC (.xlsx)", type=["xlsx"], key="prsdoc_ver")
+        with col2:
+            rm_file = st.file_uploader("Upload Risk Management Matrix (.xlsx)", type=["xlsx"], key="tm_ver")
+        
+        if prs_file and rm_file:
+            if st.button("��� Run Comparison", key="run_prs_rm_ver"):
+                with st.spinner("Processando arquivos..."):
+                    try:
+                        # Salvar os arquivos temporários com nomes previsíveis
+                        prs_path = os.path.join(tempfile.gettempdir(), "prs_doc_temp.xlsx")
+                        rm_path = os.path.join(tempfile.gettempdir(), "rm_temp.xlsx")
+                        
+                        # Salvar os arquivos carregados
+                        with open(prs_path, 'wb') as f_prs:
+                            f_prs.write(prs_file.read())
+                        
+                        with open(rm_path, 'wb') as f_rm:
+                            f_rm.write(rm_file.read())
+                        
+                        st.success("✅ Arquivos salvos com sucesso para processamento")
+                        
+                        # Carregar os arquivos usando múltiplos métodos com tratamento de erro total
+                        try:
+                            # Usar nossa nova função especializada para extrair TASY_PRS_ID
+                            all_tasy_values = extract_tasy_ids_from_excel(rm_path)
+                            
+                            # Carregar planilhas do PRS DOC
+                            xl_prs = pd.ExcelFile(prs_path)
+                            prs_sheet = get_sheet_with_fallback(xl_prs.sheet_names, 'Risk Management Matrix')
+                            
+                            # Ler o PRS ID da primeira planilha
+                            st.info("Lendo PRS IDs do documento PRS...")
+                            PRScol = get_clean_cols(prs_path, prs_sheet, 'PRS ID')
+                            PRScol = normalize_spaces(filter_ignored(PRScol, IGNORE_SENTENCES_VAL_TP_TM))
+                            
+                            # Normalizar os IDs do PRS para remover prefixos e facilitar a comparação
+                            def normalize_prs_id(prs_id):
+                                # Se já for um TASY_PRS_ID, mantenha como está
+                                if 'TASY_PRS_ID' in prs_id:
+                                    return prs_id
+                                # Caso contrário, procure por padrões numéricos como X.X.X.XXXXX
+                                matches = re.findall(r'\d+\.\d+\.\d+\.\d+', prs_id)
+                                if matches:
+                                    return matches[0]  # Retorna o primeiro formato numérico encontrado
+                                return prs_id  # Se não encontrar formato numérico, retorna o original
+                            
+                            PRScol = PRScol.apply(normalize_prs_id)
+                            st.info(f"Encontrados {len(PRScol)} PRS IDs no documento PRS.")
+                            
+                            # Criar série para normalizar TASY_PRS_ID
+                            RMcol = pd.Series(all_tasy_values)
+                            
+                            # Mostrar informações sobre os TASY_PRS_ID extraídos
+                            st.info(f"Total de TASY_PRS_ID encontrados: {len(all_tasy_values)}")
+                            if len(all_tasy_values) > 0:
+                                st.success("✅ TASY_PRS_ID extraídos com sucesso!")
+                            else:
+                                st.warning("⚠️ Nenhum TASY_PRS_ID encontrado na planilha Risk Matrix.")
+                                
+                            # Exibir os primeiros valores encontrados
+                            st.write("TASY_PRS_ID encontrados (primeiros 10):", all_tasy_values[:10])
+                            
+                            # Normalizar os TASY_PRS_ID para comparação
+                            def extract_tasy_number(tasy_id):
+                                if not isinstance(tasy_id, str):
+                                    return tasy_id
+                                match = re.search(r'TASY_PRS_ID_(\d+\.\d+\.\d+\.\d+)', tasy_id)
+                                if match:
+                                    return match.group(1)
+                                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', tasy_id)
+                                if match:
+                                    return match.group(1)
+                                return tasy_id
+                            
+                            # Aplicar normalização
+                            RMcol_normalized = RMcol.apply(extract_tasy_number)
+                            
+                            # Comparar e mostrar resultados
+                            compare_and_show_results(PRScol, RMcol, RMcol_normalized)
+                            
+                        except Exception as e:
+                            st.error(f"Erro ao processar arquivos: {str(e)}")
+                    except Exception as e:
+                        st.error(f"Erro ao salvar arquivos temporários: {str(e)}")
