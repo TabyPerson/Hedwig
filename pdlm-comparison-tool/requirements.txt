@@ -2,4 +2,6 @@ streamlit
 pandas
 openpyxl
 python-docx
-re
+beautifulsoup4
+bcrypt
+numpy
